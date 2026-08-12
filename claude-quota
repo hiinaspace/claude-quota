@@ -2,11 +2,19 @@
 # claude-quota — headless scrape of Claude Code's /usage panel; emits JSON.
 #
 # Mechanism: detached GNU screen running `claude` in a fixed cache dir (trusted
-# on first run), stuff "/usage" + arrow-downs, hardcopy the pane, parse the bars.
+# on first run), stuff "/usage", hardcopy the full scrollback (-h), parse the bars.
 # Costs no tokens: the /usage panel populates without any API message.
 # Output keys: session, week_all, plus one per model-specific bar (e.g.
 # week_fable) — each {pct, resets}. Parse failures dump the raw capture to
 # stderr and exit 1 (loud, so format drift in `claude` gets noticed).
+#
+# Per-model bars are PLAN-DEPENDENT, not guaranteed. /usage only renders a bar
+# for a model that draws on the plan's allotment. Since 2026-07-20 Fable 5 is
+# credits-only on Pro (billed in dollars, outside the plan), so on Pro this
+# emits just session + week_all; Max still shows week_fable. Callers must treat
+# per-model keys as optional — their absence is correct output, not parse drift.
+# Nothing here can observe credit spend; that ceiling is the usage-credits
+# monthly cap, which has no local signal.
 set -euo pipefail
 
 command -v screen >/dev/null || { echo "claude-quota: needs GNU screen" >&2; exit 1; }
@@ -25,8 +33,17 @@ trap cleanup EXIT
 cd "$DIR"
 screen -dmS "$NAME" claude
 
+# -h captures screen's full scrollback, not just the visible pane. Load-
+# bearing since 2026-08-12: the /usage panel grew past one screenful (a
+# "Welcome back" banner + a usage-attribution section were added above/around
+# the session/week bars), so on a real terminal the pane naturally scrolls to
+# follow the newest line, same as any shell command whose output overflows
+# the window -- a plain (non -h) hardcopy only ever sees the bottom of that,
+# which on this box is the attribution detail, with "Current session" sitting
+# above the fold. -h sees the whole thing regardless of where the render
+# happened to land, so there's no scrolling left to get wrong.
 snap() {
-  screen -S "$NAME" -X hardcopy "$CAP" 2>/dev/null && sleep 0.2 && tr -d '\0' <"$CAP" 2>/dev/null || true
+  screen -S "$NAME" -X hardcopy -h "$CAP" 2>/dev/null && sleep 0.2 && tr -d '\0' <"$CAP" 2>/dev/null || true
 }
 
 # Wait for startup; accept the one-time trust prompt for the cache dir.
@@ -46,17 +63,13 @@ screen -S "$NAME" -X stuff '/usage'
 sleep 1.5
 screen -S "$NAME" -X stuff $'\r'
 
-for _ in $(seq 1 15); do
+for _ in $(seq 1 20); do
   sleep 1
   out=$(snap)
   grep -q "Current session" <<<"$out" && break
 done
-# Scroll to bring the per-model weekly bars into the 80x24 pane.
-for _ in $(seq 1 8); do screen -S "$NAME" -X stuff $'\033[B'; sleep 0.15; done
-sleep 1
-snap >/dev/null
 
-python3 - "$CAP" <<'EOF'
+if out_json=$(python3 - "$CAP" <<'EOF'
 import json, re, sys, time
 
 text = open(sys.argv[1], errors="replace").read()
@@ -79,3 +92,13 @@ if "session" not in result or "week_all" not in result:
 result["captured_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
 print(json.dumps(result, indent=2))
 EOF
+); then
+  printf '%s\n' "$out_json"
+  # Cache the good scrape so re-reads (and the statusline's fable-week
+  # segment) are free; only overwrite on success, never clobber with a
+  # parse failure. Fixed path regardless of CLAUDE_QUOTA_DIR.
+  mkdir -p "$HOME/.cache/claude-quota"
+  printf '%s\n' "$out_json" > "$HOME/.cache/claude-quota/last.json"
+else
+  exit 1
+fi
